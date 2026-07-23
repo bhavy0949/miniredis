@@ -1,0 +1,6 @@
+# build artifacts
+miniredis
+*.o
+
+# persistence file (generated at runtime, Day 9-10)
+*.aof
