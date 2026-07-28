@@ -16,10 +16,9 @@
  * WHAT WORKS RIGHT NOW (your Day 1-3 starting point):
  *   - A blocking TCP server on port 6379
  *   - An inline text protocol (one command per line, space-separated)
- *   - Commands: PING, ECHO, SET, GET
+ *   - Commands: PING, ECHO, SET, GET, DEL, EXISTS
  *
  * WHAT'S YOURS TO BUILD (this is the resume-defining work):
- *   - DEL, EXISTS ....... Day 3  (warm-up: copy the pattern from cmd_set/cmd_get)
  *   - Event loop ........ Day 5-6 (see the big block in main() — THE centerpiece)
  *   - EXPIRE / TTL ...... Day 7-8 (the expireAtMs field in dict.h is waiting for you)
  *   - AOF persistence ... Day 9-10
@@ -81,20 +80,16 @@ static void cmd_get(int fd, int argc, char **argv) {
     reply(fd, "\n");
 }
 
-/* ---- YOUR TURN (Day 3 warm-up) --------------------------------------------
- * DEL key      -> reply "1\n" if the key existed, "0\n" if it didn't.
- *                 (hint: dictDel already returns exactly that.)
- * EXISTS key   -> reply "1\n" if present, "0\n" if not.
- * Delete these two stubs once you've implemented them for real.
- */
 static void cmd_del(int fd, int argc, char **argv) {
-    (void)argc; (void)argv;
-    reply(fd, "ERR 'del' not implemented yet — this is your Day 3 warm-up\n");
+    if (argc < 2) { reply(fd, "ERR wrong number of arguments for 'del'\n"); return; }
+    if (dictDel(g_store, argv[1])) reply(fd, "1\n"); /* dictDel returns 1 if it removed a key */
+    else                           reply(fd, "0\n"); /* 0 if the key wasn't there */
 }
 
 static void cmd_exists(int fd, int argc, char **argv) {
-    (void)argc; (void)argv;
-    reply(fd, "ERR 'exists' not implemented yet — this is your Day 3 warm-up\n");
+    if (argc < 2) { reply(fd, "ERR wrong number of arguments for 'exists'\n"); return; }
+    if (dictFind(g_store, argv[1]) != NULL) reply(fd, "1\n"); /* found it */
+    else                                    reply(fd, "0\n"); /* not found */
 }
 
 /* ---------------------------------------------------------------------------
