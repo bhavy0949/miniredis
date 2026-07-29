@@ -1,0 +1,5 @@
+# don't copy host build artifacts into the image — build fresh inside Linux
+miniredis
+*.o
+*.aof
+.git

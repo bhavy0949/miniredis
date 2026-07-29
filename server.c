@@ -2,9 +2,12 @@
 #include "dict.h"
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>   /* epoll — Linux's I/O event notification (build/run on Linux, e.g. Docker) */
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <time.h>
@@ -13,15 +16,18 @@
 /*
  * miniredis — a tiny in-memory key-value server.
  *
- * WHAT WORKS RIGHT NOW (your Day 1-3 starting point):
- *   - A blocking TCP server on port 6379
+ * WHAT WORKS RIGHT NOW:
+ *   - An EVENT-DRIVEN TCP server on port 6379 (single thread, many clients)
+ *     using epoll for I/O multiplexing.
  *   - An inline text protocol (one command per line, space-separated)
  *   - Commands: PING, ECHO, SET, GET, DEL, EXISTS
  *
- * WHAT'S YOURS TO BUILD (this is the resume-defining work):
- *   - Event loop ........ Day 5-6 (see the big block in main() — THE centerpiece)
- *   - EXPIRE / TTL ...... Day 7-8 (the expireAtMs field in dict.h is waiting for you)
+ * WHAT'S NEXT:
+ *   - EXPIRE / TTL ...... Day 7-8 (the expireAtMs field in dict.h is waiting)
  *   - AOF persistence ... Day 9-10
+ *
+ * Platform note: epoll is Linux-only. On macOS, build & run inside the
+ * provided Docker container (see the Dockerfile / README).
  *
  * Test it with:   nc 127.0.0.1 6379     then type:  PING
  */
@@ -30,12 +36,24 @@
 #define BACKLOG 16
 #define MAX_ARGS 8
 #define LINE_MAX 4096
+#define MAX_FDS 1024     /* we track each connection in a slot indexed by its fd */
 
 static dict *g_store; /* the global keyspace */
 
-/* Milliseconds since the epoch — you'll need this for TTLs on Day 7.
- * (Marked unused for now so the scaffold compiles warning-free; delete the
- * attribute once you start calling it.) */
+/* ---------------------------------------------------------------------------
+ * Per-connection state: each client gets its OWN "notepad" (read buffer),
+ * because with many clients at once their data arrives interleaved.
+ * ------------------------------------------------------------------------- */
+struct conn {
+    int    fd;              /* this client's socket */
+    char   buf[LINE_MAX];   /* bytes received but not yet fully processed */
+    size_t used;            /* how many bytes are currently in buf */
+};
+
+/* conns[fd] points to that fd's state, or is NULL if the slot is free. */
+static struct conn *conns[MAX_FDS];
+
+/* Milliseconds since the epoch — you'll need this for TTLs on Day 7. */
 __attribute__((unused))
 static long long now_ms(void) {
     struct timeval tv;
@@ -43,14 +61,14 @@ static long long now_ms(void) {
     return (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
 }
 
-/* Send a C string to the client. (For the MVP we ignore partial writes;
- * making writes robust under a full socket buffer is a good Day 12 polish task.) */
+/* Send a C string to the client. */
 static void reply(int fd, const char *s) {
     write(fd, s, strlen(s));
 }
 
 /* ---------------------------------------------------------------------------
  * Command handlers.  Each gets the already-tokenized argv (argv[0] = command).
+ * (UNCHANGED — the event loop doesn't touch command logic.)
  * ------------------------------------------------------------------------- */
 
 static void cmd_ping(int fd, int argc, char **argv) {
@@ -92,9 +110,7 @@ static void cmd_exists(int fd, int argc, char **argv) {
     else                                    reply(fd, "0\n"); /* not found */
 }
 
-/* ---------------------------------------------------------------------------
- * Dispatch: match argv[0] (case-insensitively) to a handler.
- * ------------------------------------------------------------------------- */
+/* Dispatch: match argv[0] (case-insensitively) to a handler. (UNCHANGED.) */
 static void dispatch(int fd, int argc, char **argv) {
     if (argc == 0) return;
     for (char *p = argv[0]; *p; p++) *p = (char)toupper((unsigned char)*p);
@@ -108,8 +124,7 @@ static void dispatch(int fd, int argc, char **argv) {
     else reply(fd, "ERR unknown command\n");
 }
 
-/* Split one line into argv[]. Returns argc. (strtok is fine for the MVP;
- * note it means values can't contain spaces — RESP fixes that later.) */
+/* Split one line into argv[]. Returns argc. (UNCHANGED.) */
 static int tokenize(char *line, char **argv) {
     int argc = 0;
     char *tok = strtok(line, " \t\r\n");
@@ -120,42 +135,70 @@ static int tokenize(char *line, char **argv) {
     return argc;
 }
 
-/* Serve one client until it disconnects. BLOCKING: while we're in here, no
- * other client can be served. Day 5-6 is about removing this limitation. */
-static void handle_client(int fd) {
-    char buf[LINE_MAX];
-    size_t used = 0;
+/* ---------------------------------------------------------------------------
+ * Event-loop plumbing.
+ * ------------------------------------------------------------------------- */
 
-    for (;;) {
-        ssize_t n = read(fd, buf + used, sizeof(buf) - used - 1);
-        if (n <= 0) return; /* client closed or error */
-        used += (size_t)n;
-        buf[used] = '\0';
+/* Flip a socket into "non-blocking" mode: reads/accepts never freeze; if there's
+ * nothing ready they return immediately with errno == EAGAIN. */
+static void set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
 
-        /* process every complete line currently in the buffer */
-        char *start = buf, *nl;
-        while ((nl = strchr(start, '\n')) != NULL) {
-            *nl = '\0';
-            char *argv[MAX_ARGS];
-            char linecopy[LINE_MAX];
-            snprintf(linecopy, sizeof(linecopy), "%s", start);
-            int argc = tokenize(linecopy, argv);
-            dispatch(fd, argc, argv);
-            start = nl + 1;
-        }
-        /* shift any partial (unterminated) line to the front of the buffer */
-        used = strlen(start);
-        memmove(buf, start, used + 1);
+/* Allocate state for a newly-accepted connection. */
+static struct conn *conn_new(int fd) {
+    struct conn *c = calloc(1, sizeof(*c));
+    if (!c) return NULL;
+    c->fd = fd;
+    c->used = 0;
+    conns[fd] = c;
+    return c;
+}
+
+/* Tear a connection down. Closing the socket auto-removes it from epoll. */
+static void conn_close(struct conn *c) {
+    close(c->fd);
+    conns[c->fd] = NULL;
+    free(c);
+}
+
+/* A client's socket is readable: drain what's available into its buffer, then
+ * run every complete (newline-terminated) command. Returns -1 if the connection
+ * should be closed (client hung up or errored), 0 to keep it open. */
+static int conn_read(struct conn *c) {
+    ssize_t n = read(c->fd, c->buf + c->used, sizeof(c->buf) - c->used - 1);
+    if (n == 0) return -1;                                  /* client closed */
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0; /* nothing right now */
+        return -1;                                          /* a real error */
     }
+
+    c->used += (size_t)n;
+    c->buf[c->used] = '\0';
+
+    char *start = c->buf, *nl;
+    while ((nl = strchr(start, '\n')) != NULL) {
+        *nl = '\0';
+        char *argv[MAX_ARGS];
+        char linecopy[LINE_MAX];
+        snprintf(linecopy, sizeof(linecopy), "%s", start);
+        int argc = tokenize(linecopy, argv);
+        dispatch(c->fd, argc, argv);
+        start = nl + 1;
+    }
+    c->used = strlen(start);
+    memmove(c->buf, start, c->used + 1);
+    return 0;
 }
 
 int main(void) {
     g_store = dictCreate(1024);
     if (!g_store) { perror("dictCreate"); return 1; }
 
-    /* Day 9-10: after creating the store, replay the AOF file here so the
-     * server comes back up with all previously-written data. */
+    /* Day 9-10: replay the AOF file here so we come back up with prior data. */
 
+    /* --- the usual socket setup (UNCHANGED) --- */
     int lfd = socket(AF_INET, SOCK_STREAM, 0);
     if (lfd < 0) { perror("socket"); return 1; }
 
@@ -169,38 +212,52 @@ int main(void) {
 
     if (bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { perror("bind"); return 1; }
     if (listen(lfd, BACKLOG) < 0) { perror("listen"); return 1; }
-    printf("miniredis listening on port %d (blocking, one client at a time)\n", PORT);
 
-    /* ======================================================================
-     * DAY 5-6: THE EVENT LOOP  — this is the heart of the whole project.
-     *
-     * Right now we accept ONE client and serve it to completion before we
-     * even look at the next connection. That's the same limitation your
-     * banking server had (it used fork() to work around it).
-     *
-     * Replace this accept-then-handle_client loop with a SINGLE-THREADED
-     * EVENT LOOP:
-     *
-     *   1. Set the listener socket non-blocking.
-     *   2. Create a kqueue  (macOS)  /  epoll  (Linux)  instance.
-     *   3. Register the listener for "readable" events.
-     *   4. Loop forever on kevent()/epoll_wait():
-     *        - if the listener is readable -> accept(), set the new fd
-     *          non-blocking, register it too.
-     *        - if a client fd is readable  -> read what's available into
-     *          THAT client's own buffer, extract complete lines, dispatch.
-     *        - on EOF/error -> close and unregister the fd.
-     *
-     * The key mental shift: each client needs its OWN read buffer (a small
-     * struct per fd), because reads now arrive in interleaved fragments.
-     * Once this works, one thread serves hundreds of clients concurrently —
-     * that's your headline resume bullet.
-     * ==================================================================== */
+    /* --- THE EPOLL EVENT LOOP --- */
+
+    set_nonblocking(lfd);                 /* the listener never blocks either */
+
+    int epfd = epoll_create1(0);          /* create the epoll instance ("notification service") */
+    if (epfd < 0) { perror("epoll_create1"); return 1; }
+
+    /* Tell epoll to watch the listener for "someone is trying to connect". */
+    struct epoll_event ev;
+    ev.events  = EPOLLIN;                 /* EPOLLIN = "there is data to read / a client to accept" */
+    ev.data.fd = lfd;                     /* remember which fd this event is about */
+    epoll_ctl(epfd, EPOLL_CTL_ADD, lfd, &ev);
+
+    printf("miniredis listening on port %d (epoll event loop, many clients)\n", PORT);
+
+    struct epoll_event events[64];        /* epoll hands us up-to-64 ready fds per wakeup */
     for (;;) {
-        int cfd = accept(lfd, NULL, NULL);
-        if (cfd < 0) { perror("accept"); continue; }
-        handle_client(cfd); /* <-- blocking; replace with event-loop dispatch */
-        close(cfd);
+        int n = epoll_wait(epfd, events, 64, -1);   /* sleeps until something is ready (-1 = forever) */
+        if (n < 0) { if (errno == EINTR) continue; perror("epoll_wait"); break; }
+
+        for (int i = 0; i < n; i++) {
+            int fd = events[i].data.fd;             /* which socket is ready */
+
+            if (fd == lfd) {
+                /* The listener is ready => one or more new clients are waiting.
+                 * Accept them all (loop until accept says "no more"). */
+                int cfd;
+                while ((cfd = accept(lfd, NULL, NULL)) >= 0) {
+                    if (cfd >= MAX_FDS) { close(cfd); continue; }   /* too many; drop it */
+                    set_nonblocking(cfd);
+                    struct epoll_event cev;
+                    cev.events  = EPOLLIN;
+                    cev.data.fd = cfd;
+                    epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &cev);      /* watch this client too */
+                    conn_new(cfd);                                  /* give it a notepad */
+                }
+                /* accept() returning -1 with EAGAIN just means "no more waiting". */
+            } else {
+                /* An existing client sent us something. */
+                struct conn *c = conns[fd];
+                if (!c) continue;
+                if (conn_read(c) < 0)
+                    conn_close(c);               /* client left or errored => clean up */
+            }
+        }
     }
 
     dictFree(g_store);
