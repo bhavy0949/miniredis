@@ -36,4 +36,9 @@ dictEntry *dictFind(dict *d, const char *key);
 /* Delete `key`. Returns 1 if a key was removed, 0 if it wasn't there. */
 int dictDel(dict *d, const char *key);
 
+/* Remove every entry whose TTL (expireAtMs) has already passed, given the
+ * current time in ms. Returns how many were removed. Used for "active"
+ * (background) expiration. */
+int dictActiveExpire(dict *d, long long now);
+
 #endif /* DICT_H */

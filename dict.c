@@ -91,3 +91,26 @@ int dictDel(dict *d, const char *key) {
     }
     return 0;
 }
+
+int dictActiveExpire(dict *d, long long now) {
+    int removed = 0;
+    for (size_t i = 0; i < d->nbuckets; i++) {
+        dictEntry *e = d->buckets[i], *prev = NULL;
+        while (e) {
+            dictEntry *next = e->next;   /* grab next before we possibly free e */
+            if (e->expireAtMs != -1 && now >= e->expireAtMs) {
+                if (prev) prev->next = next;
+                else      d->buckets[i] = next;
+                free(e->key);
+                free(e->val);
+                free(e);
+                d->size--;
+                removed++;
+            } else {
+                prev = e;
+            }
+            e = next;
+        }
+    }
+    return removed;
+}

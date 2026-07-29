@@ -20,10 +20,10 @@
  *   - An EVENT-DRIVEN TCP server on port 6379 (single thread, many clients)
  *     using epoll for I/O multiplexing.
  *   - An inline text protocol (one command per line, space-separated)
- *   - Commands: PING, ECHO, SET, GET, DEL, EXISTS
+ *   - Commands: PING, ECHO, SET, GET, DEL, EXISTS, EXPIRE, TTL
+ *   - Key expiry: passive (on access) + active (periodic background sweep)
  *
  * WHAT'S NEXT:
- *   - EXPIRE / TTL ...... Day 7-8 (the expireAtMs field in dict.h is waiting)
  *   - AOF persistence ... Day 9-10
  *
  * Platform note: epoll is Linux-only. On macOS, build & run inside the
@@ -36,7 +36,8 @@
 #define BACKLOG 16
 #define MAX_ARGS 8
 #define LINE_MAX 4096
-#define MAX_FDS 1024     /* we track each connection in a slot indexed by its fd */
+#define MAX_FDS 1024            /* we track each connection in a slot indexed by its fd */
+#define ACTIVE_EXPIRE_MS 100   /* how often the background sweep runs (milliseconds) */
 
 static dict *g_store; /* the global keyspace */
 
@@ -53,8 +54,7 @@ struct conn {
 /* conns[fd] points to that fd's state, or is NULL if the slot is free. */
 static struct conn *conns[MAX_FDS];
 
-/* Milliseconds since the epoch — you'll need this for TTLs on Day 7. */
-__attribute__((unused))
+/* Milliseconds since the epoch — used for TTLs / key expiry. */
 static long long now_ms(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
@@ -67,8 +67,25 @@ static void reply(int fd, const char *s) {
 }
 
 /* ---------------------------------------------------------------------------
+ * Expiry helpers.
+ * ------------------------------------------------------------------------- */
+
+/* Has this entry's TTL already passed? (expireAtMs == -1 means "never expires") */
+static int expired(dictEntry *e) {
+    return e->expireAtMs != -1 && now_ms() >= e->expireAtMs;
+}
+
+/* Look up a key, transparently deleting it if its TTL has passed. This is
+ * PASSIVE (lazy) expiration: an expired key can sit in memory until someone
+ * touches it, at which point we drop it. Returns the live entry, or NULL. */
+static dictEntry *lookup(const char *key) {
+    dictEntry *e = dictFind(g_store, key);
+    if (e && expired(e)) { dictDel(g_store, key); return NULL; }
+    return e;
+}
+
+/* ---------------------------------------------------------------------------
  * Command handlers.  Each gets the already-tokenized argv (argv[0] = command).
- * (UNCHANGED — the event loop doesn't touch command logic.)
  * ------------------------------------------------------------------------- */
 
 static void cmd_ping(int fd, int argc, char **argv) {
@@ -85,14 +102,12 @@ static void cmd_echo(int fd, int argc, char **argv) {
 static void cmd_set(int fd, int argc, char **argv) {
     if (argc < 3) { reply(fd, "ERR wrong number of arguments for 'set'\n"); return; }
     if (dictSet(g_store, argv[1], argv[2]) != 0) { reply(fd, "ERR out of memory\n"); return; }
-    reply(fd, "OK\n");
+    reply(fd, "OK\n"); /* dictSet also clears any prior TTL, like real Redis */
 }
 
 static void cmd_get(int fd, int argc, char **argv) {
     if (argc < 2) { reply(fd, "ERR wrong number of arguments for 'get'\n"); return; }
-    dictEntry *e = dictFind(g_store, argv[1]);
-    /* Day 7: before returning the value, check e->expireAtMs against now_ms()
-     * and treat the key as absent (and delete it) if it has expired. */
+    dictEntry *e = lookup(argv[1]);       /* lazily drops the key if its TTL has passed */
     if (!e) { reply(fd, "(nil)\n"); return; }
     reply(fd, e->val);
     reply(fd, "\n");
@@ -106,11 +121,32 @@ static void cmd_del(int fd, int argc, char **argv) {
 
 static void cmd_exists(int fd, int argc, char **argv) {
     if (argc < 2) { reply(fd, "ERR wrong number of arguments for 'exists'\n"); return; }
-    if (dictFind(g_store, argv[1]) != NULL) reply(fd, "1\n"); /* found it */
-    else                                    reply(fd, "0\n"); /* not found */
+    if (lookup(argv[1]) != NULL) reply(fd, "1\n"); /* found (and not expired) */
+    else                         reply(fd, "0\n"); /* not found */
 }
 
-/* Dispatch: match argv[0] (case-insensitively) to a handler. (UNCHANGED.) */
+static void cmd_expire(int fd, int argc, char **argv) {
+    if (argc < 3) { reply(fd, "ERR wrong number of arguments for 'expire'\n"); return; }
+    dictEntry *e = lookup(argv[1]);
+    if (!e) { reply(fd, "0\n"); return; }             /* no such key => 0, like Redis */
+    long long secs = atoll(argv[2]);
+    e->expireAtMs = now_ms() + secs * 1000;           /* stamp the deadline */
+    reply(fd, "1\n");
+}
+
+static void cmd_ttl(int fd, int argc, char **argv) {
+    if (argc < 2) { reply(fd, "ERR wrong number of arguments for 'ttl'\n"); return; }
+    dictEntry *e = lookup(argv[1]);
+    if (!e)                  { reply(fd, "-2\n"); return; }  /* -2: key doesn't exist */
+    if (e->expireAtMs == -1) { reply(fd, "-1\n"); return; }  /* -1: exists, but no TTL set */
+    long long ms = e->expireAtMs - now_ms();
+    long long secs = ms > 0 ? (ms + 999) / 1000 : 0;         /* round up to whole seconds */
+    char out[32];
+    snprintf(out, sizeof(out), "%lld\n", secs);
+    reply(fd, out);
+}
+
+/* Dispatch: match argv[0] (case-insensitively) to a handler. */
 static void dispatch(int fd, int argc, char **argv) {
     if (argc == 0) return;
     for (char *p = argv[0]; *p; p++) *p = (char)toupper((unsigned char)*p);
@@ -121,10 +157,12 @@ static void dispatch(int fd, int argc, char **argv) {
     else if (strcmp(argv[0], "GET")    == 0) cmd_get(fd, argc, argv);
     else if (strcmp(argv[0], "DEL")    == 0) cmd_del(fd, argc, argv);
     else if (strcmp(argv[0], "EXISTS") == 0) cmd_exists(fd, argc, argv);
+    else if (strcmp(argv[0], "EXPIRE") == 0) cmd_expire(fd, argc, argv);
+    else if (strcmp(argv[0], "TTL")    == 0) cmd_ttl(fd, argc, argv);
     else reply(fd, "ERR unknown command\n");
 }
 
-/* Split one line into argv[]. Returns argc. (UNCHANGED.) */
+/* Split one line into argv[]. Returns argc. */
 static int tokenize(char *line, char **argv) {
     int argc = 0;
     char *tok = strtok(line, " \t\r\n");
@@ -198,7 +236,7 @@ int main(void) {
 
     /* Day 9-10: replay the AOF file here so we come back up with prior data. */
 
-    /* --- the usual socket setup (UNCHANGED) --- */
+    /* --- the usual socket setup --- */
     int lfd = socket(AF_INET, SOCK_STREAM, 0);
     if (lfd < 0) { perror("socket"); return 1; }
 
@@ -215,48 +253,53 @@ int main(void) {
 
     /* --- THE EPOLL EVENT LOOP --- */
 
-    set_nonblocking(lfd);                 /* the listener never blocks either */
-
-    int epfd = epoll_create1(0);          /* create the epoll instance ("notification service") */
+    set_nonblocking(lfd);
+    int epfd = epoll_create1(0);
     if (epfd < 0) { perror("epoll_create1"); return 1; }
 
-    /* Tell epoll to watch the listener for "someone is trying to connect". */
     struct epoll_event ev;
-    ev.events  = EPOLLIN;                 /* EPOLLIN = "there is data to read / a client to accept" */
-    ev.data.fd = lfd;                     /* remember which fd this event is about */
+    ev.events  = EPOLLIN;
+    ev.data.fd = lfd;
     epoll_ctl(epfd, EPOLL_CTL_ADD, lfd, &ev);
 
     printf("miniredis listening on port %d (epoll event loop, many clients)\n", PORT);
 
-    struct epoll_event events[64];        /* epoll hands us up-to-64 ready fds per wakeup */
+    struct epoll_event events[64];
+    long long last_sweep = now_ms();
     for (;;) {
-        int n = epoll_wait(epfd, events, 64, -1);   /* sleeps until something is ready (-1 = forever) */
+        /* Wait for activity, but wake at least every ACTIVE_EXPIRE_MS so the
+         * background expiry sweep still runs when there are no clients. */
+        int n = epoll_wait(epfd, events, 64, ACTIVE_EXPIRE_MS);
         if (n < 0) { if (errno == EINTR) continue; perror("epoll_wait"); break; }
 
         for (int i = 0; i < n; i++) {
-            int fd = events[i].data.fd;             /* which socket is ready */
+            int fd = events[i].data.fd;
 
             if (fd == lfd) {
-                /* The listener is ready => one or more new clients are waiting.
-                 * Accept them all (loop until accept says "no more"). */
                 int cfd;
                 while ((cfd = accept(lfd, NULL, NULL)) >= 0) {
-                    if (cfd >= MAX_FDS) { close(cfd); continue; }   /* too many; drop it */
+                    if (cfd >= MAX_FDS) { close(cfd); continue; }
                     set_nonblocking(cfd);
                     struct epoll_event cev;
                     cev.events  = EPOLLIN;
                     cev.data.fd = cfd;
-                    epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &cev);      /* watch this client too */
-                    conn_new(cfd);                                  /* give it a notepad */
+                    epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &cev);
+                    conn_new(cfd);
                 }
-                /* accept() returning -1 with EAGAIN just means "no more waiting". */
             } else {
-                /* An existing client sent us something. */
                 struct conn *c = conns[fd];
                 if (!c) continue;
                 if (conn_read(c) < 0)
-                    conn_close(c);               /* client left or errored => clean up */
+                    conn_close(c);
             }
+        }
+
+        /* ACTIVE expiration: periodically sweep out keys whose TTL has passed,
+         * so memory isn't held by expired keys that nobody ever reads. */
+        long long now = now_ms();
+        if (now - last_sweep >= ACTIVE_EXPIRE_MS) {
+            dictActiveExpire(g_store, now);
+            last_sweep = now;
         }
     }
 
