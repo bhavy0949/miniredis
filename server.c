@@ -4,6 +4,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,11 +21,12 @@
  *   - An EVENT-DRIVEN TCP server on port 6379 (single thread, many clients)
  *     using epoll for I/O multiplexing.
  *   - An inline text protocol (one command per line, space-separated)
- *   - Commands: PING, ECHO, SET, GET, DEL, EXISTS, EXPIRE, TTL
+ *   - Commands: PING, ECHO, SET, GET, DEL, EXISTS, EXPIRE, TTL, PEXPIREAT
  *   - Key expiry: passive (on access) + active (periodic background sweep)
+ *   - AOF persistence: writes are logged to disk and replayed on startup
  *
- * WHAT'S NEXT:
- *   - AOF persistence ... Day 9-10
+ * WHAT'S NEXT (Week 4 polish):
+ *   - LRU eviction, benchmarking, tests
  *
  * Platform note: epoll is Linux-only. On macOS, build & run inside the
  * provided Docker container (see the Dockerfile / README).
@@ -38,8 +40,10 @@
 #define LINE_MAX 4096
 #define MAX_FDS 1024            /* we track each connection in a slot indexed by its fd */
 #define ACTIVE_EXPIRE_MS 100   /* how often the background sweep runs (milliseconds) */
+#define AOFPATH "miniredis.aof" /* the append-only file: our on-disk write log */
 
-static dict *g_store; /* the global keyspace */
+static dict *g_store;         /* the global keyspace */
+static FILE *g_aof = NULL;    /* the append-only file (NULL while replaying / if disabled) */
 
 /* ---------------------------------------------------------------------------
  * Per-connection state: each client gets its OWN "notepad" (read buffer),
@@ -58,11 +62,26 @@ static struct conn *conns[MAX_FDS];
 static long long now_ms(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
-    return (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    return (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000; // converting to milliseconds
 }
 
-/* Send a C string to the client. */
+/* Append a command line to the AOF (our on-disk write log). It's a no-op while
+ * g_aof is NULL — which is the case during startup replay, so replayed commands
+ * don't get logged a second time. */
+static void aof_append(const char *fmt, ...) {
+    if (!g_aof) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(g_aof, fmt, ap);
+    va_end(ap);
+    fflush(g_aof); /* push out of the C-library buffer so a restart won't lose it.
+                      For crash durability you'd also fsync() here — that's Redis's
+                      appendfsync knob (default: once per second). */
+}
+
+/* Send a C string to the client. fd < 0 is the replay sentinel: no socket to write to. */
 static void reply(int fd, const char *s) {
+    if (fd < 0) return;
     write(fd, s, strlen(s));
 }
 
@@ -86,6 +105,7 @@ static dictEntry *lookup(const char *key) {
 
 /* ---------------------------------------------------------------------------
  * Command handlers.  Each gets the already-tokenized argv (argv[0] = command).
+ * Write commands also append themselves to the AOF.
  * ------------------------------------------------------------------------- */
 
 static void cmd_ping(int fd, int argc, char **argv) {
@@ -102,6 +122,7 @@ static void cmd_echo(int fd, int argc, char **argv) {
 static void cmd_set(int fd, int argc, char **argv) {
     if (argc < 3) { reply(fd, "ERR wrong number of arguments for 'set'\n"); return; }
     if (dictSet(g_store, argv[1], argv[2]) != 0) { reply(fd, "ERR out of memory\n"); return; }
+    aof_append("SET %s %s\n", argv[1], argv[2]);   /* persist the write */
     reply(fd, "OK\n"); /* dictSet also clears any prior TTL, like real Redis */
 }
 
@@ -115,8 +136,12 @@ static void cmd_get(int fd, int argc, char **argv) {
 
 static void cmd_del(int fd, int argc, char **argv) {
     if (argc < 2) { reply(fd, "ERR wrong number of arguments for 'del'\n"); return; }
-    if (dictDel(g_store, argv[1])) reply(fd, "1\n"); /* dictDel returns 1 if it removed a key */
-    else                           reply(fd, "0\n"); /* 0 if the key wasn't there */
+    if (dictDel(g_store, argv[1])) {
+        aof_append("DEL %s\n", argv[1]);           /* persist the delete */
+        reply(fd, "1\n");
+    } else {
+        reply(fd, "0\n");
+    }
 }
 
 static void cmd_exists(int fd, int argc, char **argv) {
@@ -131,6 +156,21 @@ static void cmd_expire(int fd, int argc, char **argv) {
     if (!e) { reply(fd, "0\n"); return; }             /* no such key => 0, like Redis */
     long long secs = atoll(argv[2]);
     e->expireAtMs = now_ms() + secs * 1000;           /* stamp the deadline */
+    /* Log as an ABSOLUTE deadline so a restart restores the real expiry time
+     * instead of resetting the countdown (this is why we have PEXPIREAT). */
+    aof_append("PEXPIREAT %s %lld\n", argv[1], e->expireAtMs);
+    reply(fd, "1\n");
+}
+
+/* PEXPIREAT key ms — set an absolute expiry deadline (ms since the epoch).
+ * Mostly an internal/AOF command: EXPIRE is logged as PEXPIREAT so replay
+ * restores the true deadline. */
+static void cmd_pexpireat(int fd, int argc, char **argv) {
+    if (argc < 3) { reply(fd, "ERR wrong number of arguments for 'pexpireat'\n"); return; }
+    dictEntry *e = lookup(argv[1]);
+    if (!e) { reply(fd, "0\n"); return; }
+    e->expireAtMs = atoll(argv[2]);
+    aof_append("PEXPIREAT %s %s\n", argv[1], argv[2]);
     reply(fd, "1\n");
 }
 
@@ -151,14 +191,15 @@ static void dispatch(int fd, int argc, char **argv) {
     if (argc == 0) return;
     for (char *p = argv[0]; *p; p++) *p = (char)toupper((unsigned char)*p);
 
-    if      (strcmp(argv[0], "PING")   == 0) cmd_ping(fd, argc, argv);
-    else if (strcmp(argv[0], "ECHO")   == 0) cmd_echo(fd, argc, argv);
-    else if (strcmp(argv[0], "SET")    == 0) cmd_set(fd, argc, argv);
-    else if (strcmp(argv[0], "GET")    == 0) cmd_get(fd, argc, argv);
-    else if (strcmp(argv[0], "DEL")    == 0) cmd_del(fd, argc, argv);
-    else if (strcmp(argv[0], "EXISTS") == 0) cmd_exists(fd, argc, argv);
-    else if (strcmp(argv[0], "EXPIRE") == 0) cmd_expire(fd, argc, argv);
-    else if (strcmp(argv[0], "TTL")    == 0) cmd_ttl(fd, argc, argv);
+    if      (strcmp(argv[0], "PING")      == 0) cmd_ping(fd, argc, argv);
+    else if (strcmp(argv[0], "ECHO")      == 0) cmd_echo(fd, argc, argv);
+    else if (strcmp(argv[0], "SET")       == 0) cmd_set(fd, argc, argv);
+    else if (strcmp(argv[0], "GET")       == 0) cmd_get(fd, argc, argv);
+    else if (strcmp(argv[0], "DEL")       == 0) cmd_del(fd, argc, argv);
+    else if (strcmp(argv[0], "EXISTS")    == 0) cmd_exists(fd, argc, argv);
+    else if (strcmp(argv[0], "EXPIRE")    == 0) cmd_expire(fd, argc, argv);
+    else if (strcmp(argv[0], "PEXPIREAT") == 0) cmd_pexpireat(fd, argc, argv);
+    else if (strcmp(argv[0], "TTL")       == 0) cmd_ttl(fd, argc, argv);
     else reply(fd, "ERR unknown command\n");
 }
 
@@ -171,6 +212,23 @@ static int tokenize(char *line, char **argv) {
         tok = strtok(NULL, " \t\r\n");
     }
     return argc;
+}
+
+/* Replay a previously-saved AOF: re-run every logged command to rebuild the
+ * keyspace. Runs BEFORE g_aof is opened for appending, so replayed commands
+ * aren't logged again. fd = -1 makes reply() a no-op. */
+static void aof_load(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return;                        /* no AOF yet -> fresh start */
+    char line[LINE_MAX];
+    int count = 0;
+    while (fgets(line, sizeof(line), f)) {
+        char *argv[MAX_ARGS];
+        int argc = tokenize(line, argv);   /* strtok also strips the trailing '\n' */
+        if (argc > 0) { dispatch(-1, argc, argv); count++; }
+    }
+    fclose(f);
+    printf("AOF: replayed %d commands from %s\n", count, path);
 }
 
 /* ---------------------------------------------------------------------------
@@ -234,7 +292,12 @@ int main(void) {
     g_store = dictCreate(1024);
     if (!g_store) { perror("dictCreate"); return 1; }
 
-    /* Day 9-10: replay the AOF file here so we come back up with prior data. */
+    /* 1) Rebuild state from a previous run, THEN 2) open the AOF for appending.
+     * Order matters: replay must happen while g_aof is still NULL so replayed
+     * commands don't get re-logged. */
+    aof_load(AOFPATH);
+    g_aof = fopen(AOFPATH, "a");
+    if (!g_aof) perror("fopen aof (continuing without persistence)");
 
     /* --- the usual socket setup --- */
     int lfd = socket(AF_INET, SOCK_STREAM, 0);
